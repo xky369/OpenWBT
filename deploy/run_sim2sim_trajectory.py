@@ -5,10 +5,15 @@ Sim2sim trajectory tracking benchmark for OpenWBT (MuJoCo + squat policy + Pinoc
 Reference trajectory: CSV with columns matching ``TrajectorySampler`` in
 ``rl_ik_solver/.../trajectory.py`` (torso-frame wrist targets as x,y,z,roll,pitch,yaw).
 
-Metrics: same definitions as ``TrackingErrorMonitor`` in that file. Command and
-error are both **``wrist_yaw_link`` in ``torso_link``** (CSV + MuJoCo bodies).
-IK internally tracks Pinocchio ``L_ee`` / ``R_ee`` (``+0.05`` m along wrist x from
-``robot_arm_ik``); the script maps wrist targets to that frame before ``solve_ik``.
+Metrics: same ``TrackingErrorMonitor`` math as ``trajectory.py``. By default
+(``--metrics_actual_source rl_fk``) **actual** pose is ``larm_forward`` /
+``rarm_forward`` on arm joints, with the same ``joint2motor_idx`` reordering and
+``LEFT_ARM_JOINT_IDX`` / ``RIGHT_ARM_JOINT_IDX`` as that file (see
+``deploy/evaluation/g1_rl_trajectory_fk.py``). Optional ``mujoco`` uses
+``torso_link``-expressed ``*_wrist_yaw_link`` bodies instead.
+
+CSV targets remain 6D torso-frame wrist (same as RL command). IK still maps
+wrist targets to Pinocchio ``L_ee`` / ``R_ee`` before ``solve_ik``.
 
 Run from repository root::
 
@@ -38,6 +43,7 @@ if str(_REPO_ROOT) not in sys.path:
 os.chdir(_REPO_ROOT)
 
 from deploy.config import Config
+from deploy.evaluation.g1_rl_trajectory_fk import fk_actual_pose7_pair_from_mujoco_qj
 from deploy.evaluation.tracking_metrics import (
     CommandSmoothnessMonitor,
     TrackingErrorMonitor,
@@ -78,6 +84,21 @@ def torso_frame_wrist_poses(m: mujoco.MjModel, d: mujoco.MjData) -> tuple[np.nda
     T_l = T_w_inv @ mj_body_T_world(m, d, "left_wrist_yaw_link")
     T_r = T_w_inv @ mj_body_T_world(m, d, "right_wrist_yaw_link")
     return T_to_pose7_xyz_quat_wxyz(T_l), T_to_pose7_xyz_quat_wxyz(T_r)
+
+
+def actual_arm_pose7_for_metrics(
+    m: mujoco.MjModel,
+    d: mujoco.MjData,
+    dof_idx: np.ndarray,
+    source: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if source == "rl_fk":
+        qj = d.qpos[7:][dof_idx].astype(np.float64)
+        return fk_actual_pose7_pair_from_mujoco_qj(qj, dof_idx)
+    if source == "mujoco":
+        l7, r7 = torso_frame_wrist_poses(m, d)
+        return l7.astype(np.float64), r7.astype(np.float64)
+    raise ValueError(f"Unknown --metrics_actual_source {source!r} (use rl_fk or mujoco).")
 
 
 def pd_torques(
@@ -128,6 +149,17 @@ def main() -> None:
         default=None,
         metavar=("H", "P"),
         help="Override squat policy command [height, pitch]; default uses squat config cmd_debug.",
+    )
+    parser.add_argument(
+        "--metrics_actual_source",
+        type=str,
+        choices=("rl_fk", "mujoco"),
+        default="rl_fk",
+        help=(
+            "How to build 7D actual pose for TrackingErrorMonitor: "
+            "'rl_fk' matches trajectory.py (larm_forward/rarm_forward + g1_upper_ik joint2motor_idx); "
+            "'mujoco' uses torso_link <- wrist_yaw_link bodies."
+        ),
     )
     args = parser.parse_args()
 
@@ -218,7 +250,7 @@ def main() -> None:
     for _ in range(settle_physics_steps):
         physics_substep(hold_arms=True, left_euler6=le_hold, right_euler6=re_hold)
 
-    left_pose7_0, right_pose7_0 = torso_frame_wrist_poses(m, d)
+    left_pose7_0, right_pose7_0 = actual_arm_pose7_for_metrics(m, d, dof_idx, args.metrics_actual_source)
     left_start_pos = left_pose7_0[:3].copy()
     right_start_pos = right_pose7_0[:3].copy()
     left_start_q = left_pose7_0[3:7].copy()
@@ -284,7 +316,7 @@ def main() -> None:
 
             if smooth_monitor is not None:
                 smooth_monitor.update(elapsed, target_dof_pos)
-            l_act, r_act = torso_frame_wrist_poses(m, d)
+            l_act, r_act = actual_arm_pose7_for_metrics(m, d, dof_idx, args.metrics_actual_source)
             error_monitor.update(
                 elapsed_time=elapsed,
                 left_target_euler=le,
