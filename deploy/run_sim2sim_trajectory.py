@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Sim2sim trajectory tracking benchmark for OpenWBT (MuJoCo + squat policy + Pinocchio arm IK).
+Sim2sim trajectory tracking benchmark for OpenWBT (MuJoCo + low-level leg policy
+[loco | squat | none] + Pinocchio arm IK).
 
 Reference trajectory: CSV with columns matching ``TrajectorySampler`` in
 ``rl_ik_solver/.../trajectory.py`` (torso-frame wrist targets as x,y,z,roll,pitch,yaw).
@@ -23,17 +24,21 @@ RL-vs-WBT side-by-side scripts can consume them unchanged. ``runtime_type`` is
 ``"openwbt_sim2sim"`` and ``compute.time_ms_*`` reports per-control-step IK
 solve time (the R2S2 equivalent of policy inference time).
 
-Run from repository root::
+Run from repository root (default leg policy is ``loco`` in stance mode, which
+just stands in place while arms track the trajectory)::
 
     python deploy/run_sim2sim_trajectory.py \
         --trajectory_csv traj1.csv \
         --viewer --realtime --wait_for_keypress \
-        --settle_sec 3.0 --settle_hold_zero_sec 1.0 --cmd_ramp_sec 1.0 \
-        --stabilize_qvel_thresh 0.3 --stabilize_max_sec 5.0 \
-        --ramp_in_sec 2.0 \
+        --settle_sec 3.0 --ramp_in_sec 2.0 --stabilize_qvel_thresh 0.3 \
         --output_json deploy/evaluation/results/wbt_traj1.json
 
-Requires ``ckpts/squat.onnx`` (see ``deploy/configs/g1_squat.yaml``). Do not import
+Use ``--leg_policy squat`` for the older squat policy (with ``--squat_cmd H P``
+for its [height_delta, pitch_delta] command) or ``--leg_policy none`` to
+PD-hold legs + waist at ``run_cfg.default_angles`` with no policy at all.
+
+Requires ``ckpts/loco.onnx`` and / or ``ckpts/squat.onnx`` (see
+``deploy/configs/g1_loco.yaml`` / ``g1_squat.yaml``). Do not import
 ``deploy.controllers.controller`` here (USB / DDS side effects).
 """
 
@@ -77,7 +82,7 @@ from deploy.evaluation.tracking_metrics import (
     t_trans,
     T_to_pose7_xyz_quat_wxyz,
 )
-from deploy.helpers.policy_unified import SquatLowLevelPolicy
+from deploy.helpers.policy_unified import LocoLowLevelPolicy, SquatLowLevelPolicy
 from deploy.helpers.rotation_helper import get_gravity_orientation
 from deploy.teleop.robot_control.robot_arm_ik import G1_29_ArmIK
 
@@ -201,26 +206,59 @@ def main() -> None:
     parser.add_argument("--smoothness_print_hz", type=float, default=0.0, help="<=0 disables smoothness prints.")
     parser.add_argument("--disable_smoothness", action="store_true")
     parser.add_argument(
+        "--leg_policy",
+        type=str,
+        choices=("loco", "squat", "none"),
+        default="loco",
+        help=(
+            "Which low-level policy regulates the legs. 'loco' uses ckpts/loco.onnx "
+            "at cmd=[0,0,0] + stance=True, which is the cleanest 'stand still' mode "
+            "(recommended for arm tracking benchmarks). 'squat' uses ckpts/squat.onnx "
+            "and tends to sit in a crouched pose even at cmd=[0,0] because its "
+            "training prior is squatted. 'none' disables the policy entirely and "
+            "PD-holds legs + waist at run_cfg.default_angles."
+        ),
+    )
+    parser.add_argument(
         "--squat_cmd",
         type=float,
         nargs=2,
         default=None,
         metavar=("H", "P"),
         help=(
-            "Squat policy command [height_delta, pitch_delta]. Defaults to [0, 0] "
-            "(nominal standing pose controlled by the squat policy). For a shallow "
-            "squat try e.g. '-0.2 0.0'. Values must stay within the policy's "
-            "training range (see max_cmd in the squat YAML); the default cmd_debug "
-            "is usually a deep debug pose outside that range and breaks tracking."
+            "Squat policy command [height_delta, pitch_delta] when --leg_policy "
+            "squat. Default [0, 0] is the policy's nominal pose. Stay inside "
+            "max_cmd from the squat YAML; --use_cmd_debug forces cmd_debug instead."
         ),
     )
     parser.add_argument(
         "--use_cmd_debug",
         action="store_true",
         help=(
-            "Force --squat_cmd = squat YAML cmd_debug (legacy deep-squat default). "
-            "Off by default because cmd_debug is often outside max_cmd training "
-            "range and causes base instability + tracking failure."
+            "When --leg_policy squat, force cmd = squat YAML cmd_debug (legacy "
+            "deep-squat default). Off by default because cmd_debug is often "
+            "outside max_cmd training range and destabilises the base."
+        ),
+    )
+    parser.add_argument(
+        "--loco_cmd",
+        type=float,
+        nargs=3,
+        default=(0.0, 0.0, 0.0),
+        metavar=("VX", "VY", "WZ"),
+        help=(
+            "Loco policy command (body-frame m/s, m/s, rad/s) when --leg_policy "
+            "loco. Default [0, 0, 0] = stand still. Non-zero only meaningful with "
+            "--loco_walk; otherwise cmd is forced to zero in stance mode."
+        ),
+    )
+    parser.add_argument(
+        "--loco_walk",
+        action="store_true",
+        help=(
+            "When --leg_policy loco, run the gait planner in walking mode with "
+            "--loco_cmd instead of freezing to mid-stance. Off by default because "
+            "walking while tracking an arm trajectory is not usually what you want."
         ),
     )
     parser.add_argument(
@@ -326,17 +364,42 @@ def main() -> None:
         "--disable_squat_policy",
         action="store_true",
         help=(
-            "Skip the squat policy entirely: legs and waist are PD-held at "
-            "run_cfg.default_angles for the whole run. Robot just stands. "
-            "Overrides --squat_cmd / --cmd_ramp_sec / --policy_warmup_iters."
+            "Deprecated alias for --leg_policy none. Kept for backward compat; "
+            "use --leg_policy none in new scripts."
         ),
     )
     args = parser.parse_args()
 
     run_cfg = Config(str(Path(args.runner_config).resolve()))
+
+    # --disable_squat_policy is a deprecated alias for --leg_policy none (from
+    # before loco support existed). If the user set it AND left --leg_policy at
+    # the new default, honour the old flag; if both were set explicitly, the
+    # explicit --leg_policy wins and we warn.
+    leg_policy_kind = args.leg_policy
+    if args.disable_squat_policy:
+        if args.leg_policy == "loco":
+            leg_policy_kind = "none"
+            print("[sim2sim] --disable_squat_policy is deprecated; treating as --leg_policy none")
+        elif args.leg_policy != "none":
+            print(
+                f"[sim2sim] WARNING: --disable_squat_policy set together with "
+                f"--leg_policy {args.leg_policy}; --leg_policy wins."
+            )
+
     squat_cfg_path = _REPO_ROOT / "deploy" / "configs" / getattr(run_cfg, "squat_config", "g1_squat.yaml")
-    squat_cfg = Config(str(squat_cfg_path.resolve()))
-    squat_cfg.policy_path = resolve_policy_path(squat_cfg)
+    loco_cfg_path = _REPO_ROOT / "deploy" / "configs" / getattr(run_cfg, "loco_config", "g1_loco.yaml")
+
+    if leg_policy_kind == "squat":
+        leg_cfg_path = squat_cfg_path
+    elif leg_policy_kind == "loco":
+        leg_cfg_path = loco_cfg_path
+    else:
+        # No leg policy runs, but we still need kps / kds from somewhere. Squat
+        # and loco YAMLs share the same PD gains, so either works.
+        leg_cfg_path = squat_cfg_path
+    leg_cfg = Config(str(leg_cfg_path.resolve()))
+    leg_cfg.policy_path = resolve_policy_path(leg_cfg)
 
     traj_path = Path(args.trajectory_csv).expanduser().resolve()
     trajectory = TrajectorySampler(traj_path)
@@ -354,7 +417,18 @@ def main() -> None:
     n_dof = int(run_cfg.num_dof)
 
     arm_ik = G1_29_ArmIK(Unit_Test=False, Visualization=False)
-    squat_policy = SquatLowLevelPolicy(squat_cfg)
+
+    # Instantiate the low-level leg policy. Both policies only touch the 12 leg
+    # joints via ``leg_cfg.action_idx``; waist + arms remain our responsibility.
+    if leg_policy_kind == "squat":
+        leg_policy_obj: SquatLowLevelPolicy | LocoLowLevelPolicy | None = SquatLowLevelPolicy(leg_cfg)
+    elif leg_policy_kind == "loco":
+        leg_policy_obj = LocoLowLevelPolicy(leg_cfg)
+    else:
+        leg_policy_obj = None
+    # Leg-policy cfg arrays pre-cast once; avoids per-step np.array creation.
+    leg_cfg_dof_idx = np.asarray(leg_cfg.dof_idx, dtype=np.int64)
+    leg_cfg_action_idx = np.asarray(leg_cfg.action_idx, dtype=np.int64)
 
     mujoco.mj_resetData(m, d)
     d.qpos[0:3] = [0.0, 0.0, 0.793]
@@ -364,40 +438,58 @@ def main() -> None:
     mujoco.mj_forward(m, d)
 
     target_dof_pos = np.array(run_cfg.default_angles, dtype=np.float64).copy()
-    kps = np.array(squat_cfg.kps, dtype=np.float64)
-    kds = np.array(squat_cfg.kds, dtype=np.float64)
+    kps = np.array(leg_cfg.kps, dtype=np.float64)
+    kds = np.array(leg_cfg.kds, dtype=np.float64)
 
     decimation = int(run_cfg.control_decimation)
     sim_dt = float(run_cfg.simulation_dt)
     control_dt = float(run_cfg.control_dt)
 
-    # Resolve the squat policy command. Default (no args) is [0, 0] = nominal
-    # standing, which keeps the base stable and leaves the arm full workspace
-    # for tracking. cmd_debug from the YAML is often a debug deep-squat value
-    # outside the policy's max_cmd training range and destabilises tracking, so
-    # it's opt-in via --use_cmd_debug.
-    if args.squat_cmd is not None:
-        cmd_target = np.array(args.squat_cmd, dtype=np.float32)
-        cmd_source = "--squat_cmd"
-    elif args.use_cmd_debug:
-        cmd_target = np.array(squat_cfg.cmd_debug, dtype=np.float32).copy()
-        cmd_source = "squat_cfg.cmd_debug (--use_cmd_debug)"
+    # Resolve the low-level policy command vector. Shape is policy-specific:
+    #   squat: [height_delta, pitch_delta]   (YAML max_cmd ~ [0.4, 0.5])
+    #   loco : [vx, vy, wz] body frame        (YAML max_cmd ~ [0.3, 0.3, 0.3])
+    # ``cmd_source`` is only for the startup log line.
+    if leg_policy_kind == "squat":
+        if args.squat_cmd is not None:
+            cmd_target = np.array(args.squat_cmd, dtype=np.float32)
+            cmd_source = "--squat_cmd"
+        elif args.use_cmd_debug:
+            cmd_target = np.array(leg_cfg.cmd_debug, dtype=np.float32).copy()
+            cmd_source = "squat YAML cmd_debug (--use_cmd_debug)"
+        else:
+            cmd_target = np.zeros(2, dtype=np.float32)
+            cmd_source = "default [0, 0] (nominal standing)"
+    elif leg_policy_kind == "loco":
+        cmd_target = np.array(args.loco_cmd, dtype=np.float32)
+        cmd_source = "--loco_cmd"
+        if not args.loco_walk and np.any(cmd_target != 0.0):
+            print(
+                f"[sim2sim] NOTE: --loco_cmd={cmd_target.tolist()} ignored because "
+                "--loco_walk is off; loco runs in stance mode with cmd forced to zero."
+            )
+            cmd_target = np.zeros(3, dtype=np.float32)
     else:
-        cmd_target = np.zeros(2, dtype=np.float32)
-        cmd_source = "default [0, 0] (nominal standing)"
+        cmd_target = np.zeros(0, dtype=np.float32)
+        cmd_source = "n/a (no leg policy)"
     cmd_now = np.zeros_like(cmd_target)
 
-    max_cmd = np.asarray(getattr(squat_cfg, "max_cmd", [np.inf, np.inf]), dtype=np.float32)
-    if not args.disable_squat_policy:
-        print(f"[sim2sim] squat cmd = {cmd_target.tolist()} (from {cmd_source})")
+    max_cmd = np.asarray(
+        getattr(leg_cfg, "max_cmd", [np.inf] * cmd_target.shape[0]),
+        dtype=np.float32,
+    )
+    if leg_policy_kind == "squat":
+        print(f"[sim2sim] leg_policy=squat, cmd={cmd_target.tolist()} (from {cmd_source})")
         if np.any(np.abs(cmd_target) > max_cmd + 1e-6):
             print(
                 f"[sim2sim] WARNING: |cmd_target|={np.abs(cmd_target).tolist()} exceeds "
-                f"max_cmd={max_cmd.tolist()} from squat YAML; policy is being driven "
-                "out of its training distribution and may destabilise the base + break tracking."
+                f"max_cmd={max_cmd.tolist()} from squat YAML; policy is out of its "
+                "training distribution and will destabilise the base + break tracking."
             )
+    elif leg_policy_kind == "loco":
+        mode = "walking with --loco_cmd" if args.loco_walk else "stance (cmd forced to 0)"
+        print(f"[sim2sim] leg_policy=loco, mode={mode}, cmd={cmd_target.tolist()}")
     else:
-        print("[sim2sim] squat policy disabled; legs + waist PD-held at run_cfg.default_angles")
+        print("[sim2sim] leg_policy=none; legs + waist PD-held at run_cfg.default_angles")
 
     viewer = mujoco.viewer.launch_passive(m, d) if args.viewer else None
     sync_every = max(1, int(args.viewer_sync_every_n_substeps))
@@ -418,21 +510,26 @@ def main() -> None:
     ) -> None:
         nonlocal target_dof_pos, counter
         if counter % decimation == 0:
-            if args.disable_squat_policy:
-                # Keep legs & waist at run_cfg.default_angles; only the arms are
-                # touched below (hold or IK). target_dof_pos already starts at
-                # run_cfg.default_angles, so no-op for the leg / waist slice.
+            if leg_policy_kind == "none":
+                # Legs + waist stay at run_cfg.default_angles via PD; target_dof_pos
+                # was initialised from default_angles so the leg / waist slice
+                # needs no update here. Arms are handled below.
                 pass
             else:
-                qj = d.qpos[7:][dof_idx].astype(np.float32)
-                dqj = d.qvel[6:][dof_idx].astype(np.float32)
                 quat = d.qpos[3:7].astype(np.float32)
                 omega = d.qvel[3:6].astype(np.float32)
                 g = get_gravity_orientation(quat).astype(np.float32)
-                td = target_dof_pos.astype(np.float32).copy()
-                _, _, leg_slice = squat_policy.inference(cmd_now, g, omega, qj, dqj)
-                target_dof_pos[:] = td.astype(np.float64)
-                target_dof_pos[squat_cfg.action_idx] = leg_slice.astype(np.float64)
+                # Each policy needs qj / dqj reordered to its own dof_idx (squat
+                # expects all 29 joints, loco expects only the 12 leg joints).
+                qj_leg = d.qpos[7:][leg_cfg_dof_idx].astype(np.float32)
+                dqj_leg = d.qvel[6:][leg_cfg_dof_idx].astype(np.float32)
+                if leg_policy_kind == "loco":
+                    # Advance the gait clock. stance=True locks the clock to
+                    # mid-stance, producing a standing pose instead of a walk
+                    # cycle. Without this the loco policy marches in place.
+                    leg_policy_obj.gait_planner.update_gait_phase(stop=not args.loco_walk)
+                _, _, leg_slice = leg_policy_obj.inference(cmd_now, g, omega, qj_leg, dqj_leg)
+                target_dof_pos[leg_cfg_action_idx] = leg_slice.astype(np.float64)
 
             if hold_arms:
                 target_dof_pos[action_hl_idx] = d.qpos[7:][action_hl_idx].astype(np.float64)
@@ -471,26 +568,29 @@ def main() -> None:
         if remaining > 0.0:
             time.sleep(remaining)
 
-    # Warm up the squat policy's recurrent hidden state with cmd=[0,0] and the
+    # Warm up the leg policy's recurrent hidden state with cmd=0 and the
     # stationary initial joint state, BEFORE stepping physics. Without this the
     # first ~10 policy outputs are garbage (all-zero hidden state) and the legs
-    # jerk violently the moment we start integrating. Skipped if we're running
-    # without the squat policy at all.
-    if not args.disable_squat_policy:
+    # jerk violently the moment we start integrating. For loco we also advance
+    # the gait clock in stance mode so it enters settle at mid-stance. Skipped
+    # when there is no leg policy.
+    if leg_policy_obj is not None:
         for _ in range(max(0, int(args.policy_warmup_iters))):
-            qj0 = d.qpos[7:][dof_idx].astype(np.float32)
-            dqj0 = d.qvel[6:][dof_idx].astype(np.float32)
+            qj0 = d.qpos[7:][leg_cfg_dof_idx].astype(np.float32)
+            dqj0 = d.qvel[6:][leg_cfg_dof_idx].astype(np.float32)
             quat0 = d.qpos[3:7].astype(np.float32)
             omega0 = d.qvel[3:6].astype(np.float32)
             g0 = get_gravity_orientation(quat0).astype(np.float32)
-            squat_policy.inference(np.zeros_like(cmd_target), g0, omega0, qj0, dqj0)
+            if leg_policy_kind == "loco":
+                leg_policy_obj.gait_planner.update_gait_phase(stop=not args.loco_walk)
+            leg_policy_obj.inference(np.zeros_like(cmd_target), g0, omega0, qj0, dqj0)
 
     if args.wait_for_keypress:
         if viewer is not None:
             viewer.sync()
         try:
             input(
-                "[sim2sim] Press Enter to start the squat policy + settle "
+                "[sim2sim] Press Enter to start the leg policy + settle "
                 "(tracking will NOT begin until the robot is stable) ... "
             )
         except EOFError:
@@ -512,15 +612,17 @@ def main() -> None:
 
     settle_control_steps = max(0, int(round(args.settle_sec / control_dt)))
     # Split settle_sec into three back-to-back sub-phases, all with physics +
-    # squat policy active and arms PD-held:
-    #   [0, hold_zero_steps)        -> cmd_now = 0        (robot lands + locks
-    #                                                      legs at neutral)
-    #   [hold_zero_steps, +ramp)    -> cmd_now = a*target (smooth ramp)
-    #   [+ramp, settle_end)         -> cmd_now = target   (hold target pose)
-    # Irrelevant when the squat policy is disabled (cmd_now stays 0 throughout
-    # and legs are PD-held at default_angles).
-    if args.disable_squat_policy:
-        hold_zero_steps = 0
+    # leg policy (if any) active and arms PD-held at their initial qpos:
+    #   [0, hold_zero_steps)       -> cmd_now = 0        (robot lands + locks
+    #                                                     legs at neutral)
+    #   [hold_zero_steps, +ramp)   -> cmd_now = a*target (smooth ramp)
+    #   [+ramp, settle_end)        -> cmd_now = target   (hold target pose)
+    # When leg_policy_kind is 'none' or cmd_target is already zero (loco stance,
+    # default squat), cmd_now stays 0 throughout and only hold_zero is
+    # meaningful.
+    ramp_meaningful = leg_policy_obj is not None and np.any(cmd_target != 0.0)
+    if not ramp_meaningful:
+        hold_zero_steps = settle_control_steps
         cmd_ramp_steps = 0
     else:
         hold_zero_steps = min(
@@ -534,7 +636,7 @@ def main() -> None:
     le_hold = np.zeros(6, dtype=np.float64)
     re_hold = np.zeros(6, dtype=np.float64)
     for k in range(settle_control_steps):
-        if args.disable_squat_policy:
+        if not ramp_meaningful:
             cmd_now[:] = 0.0
         elif k < hold_zero_steps:
             cmd_now[:] = 0.0
@@ -544,7 +646,7 @@ def main() -> None:
         else:
             cmd_now[:] = cmd_target
         advance_one_control_step(hold_arms=True, le=le_hold, re=re_hold)
-    if not args.disable_squat_policy:
+    if ramp_meaningful:
         cmd_now[:] = cmd_target
 
     # Wait for the robot to actually stop moving before touching arms or
@@ -725,6 +827,10 @@ def main() -> None:
         "trajectory_csv": str(traj_path),
         "trajectory_name": traj_path.stem,
         "runner_config": str(Path(args.runner_config).resolve()),
+        "leg_policy": leg_policy_kind,
+        "leg_policy_config": str(leg_cfg_path.resolve()),
+        "leg_policy_cmd": cmd_target.tolist(),
+        "loco_walk": bool(args.loco_walk) if leg_policy_kind == "loco" else None,
         "squat_config": str(squat_cfg_path.resolve()),
         "xml_path": str(xml_path),
         "loop_trajectory": args.loop_trajectory,
