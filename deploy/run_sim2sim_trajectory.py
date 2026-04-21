@@ -17,7 +17,13 @@ wrist targets to Pinocchio ``L_ee`` / ``R_ee`` before ``solve_ik``.
 
 Run from repository root::
 
-    python deploy/run_sim2sim_trajectory.py --trajectory_csv /path/to/traj1.csv
+    python deploy/run_sim2sim_trajectory.py \
+        --trajectory_csv traj1.csv \
+        --viewer --realtime --wait_for_keypress \
+        --disable_squat_policy \
+        --settle_sec 1.5 --ramp_in_sec 2.0 \
+        --error_log_csv deploy/evaluation/results/sim2sim_traj1_err.csv \
+        --output_json deploy/evaluation/results/sim2sim_traj1.json
 
 Requires ``ckpts/squat.onnx`` (see ``deploy/configs/g1_squat.yaml``). Do not import
 ``deploy.controllers.controller`` here (USB / DDS side effects).
@@ -199,6 +205,47 @@ def main() -> None:
             "larger values reduce GUI overhead)."
         ),
     )
+    parser.add_argument(
+        "--wait_for_keypress",
+        action="store_true",
+        help=(
+            "After the robot is placed at the initial pose, block on stdin until the "
+            "user presses Enter before advancing simulation. Useful when combined "
+            "with --viewer so the viewer opens, settles on the default pose, and you "
+            "can aim the camera before the squat policy engages."
+        ),
+    )
+    parser.add_argument(
+        "--cmd_ramp_sec",
+        type=float,
+        default=1.0,
+        help=(
+            "During settle, ramp the squat command from [0, 0] up to --squat_cmd / "
+            "cmd_debug over this many seconds (part of --settle_sec). Stops the "
+            "legs from being commanded to a full deep squat from t=0. Set 0 to "
+            "disable and use the target command from step 1."
+        ),
+    )
+    parser.add_argument(
+        "--policy_warmup_iters",
+        type=int,
+        default=20,
+        help=(
+            "Before any physics step, run the squat policy this many times at "
+            "cmd=[0,0] with the initial joint state so its recurrent hidden state "
+            "leaves the zero-initialised transient. Not stepping physics during "
+            "warm-up keeps the viewer visually still. Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--disable_squat_policy",
+        action="store_true",
+        help=(
+            "Skip the squat policy entirely: legs and waist are PD-held at "
+            "run_cfg.default_angles for the whole run. Robot just stands. "
+            "Overrides --squat_cmd / --cmd_ramp_sec / --policy_warmup_iters."
+        ),
+    )
     args = parser.parse_args()
 
     run_cfg = Config(str(Path(args.runner_config).resolve()))
@@ -239,7 +286,8 @@ def main() -> None:
     sim_dt = float(run_cfg.simulation_dt)
     control_dt = float(run_cfg.control_dt)
 
-    cmd_raw = squat_cfg.cmd_debug.copy() if args.squat_cmd is None else np.array(args.squat_cmd, dtype=np.float32)
+    cmd_target = squat_cfg.cmd_debug.copy() if args.squat_cmd is None else np.array(args.squat_cmd, dtype=np.float32)
+    cmd_now = np.zeros_like(cmd_target)
 
     viewer = mujoco.viewer.launch_passive(m, d) if args.viewer else None
     sync_every = max(1, int(args.viewer_sync_every_n_substeps))
@@ -254,15 +302,21 @@ def main() -> None:
     ) -> None:
         nonlocal target_dof_pos, counter
         if counter % decimation == 0:
-            qj = d.qpos[7:][dof_idx].astype(np.float32)
-            dqj = d.qvel[6:][dof_idx].astype(np.float32)
-            quat = d.qpos[3:7].astype(np.float32)
-            omega = d.qvel[3:6].astype(np.float32)
-            g = get_gravity_orientation(quat).astype(np.float32)
-            td = target_dof_pos.astype(np.float32).copy()
-            _, _, leg_slice = squat_policy.inference(cmd_raw, g, omega, qj, dqj)
-            target_dof_pos[:] = td.astype(np.float64)
-            target_dof_pos[squat_cfg.action_idx] = leg_slice.astype(np.float64)
+            if args.disable_squat_policy:
+                # Keep legs & waist at run_cfg.default_angles; only the arms are
+                # touched below (hold or IK). target_dof_pos already starts at
+                # run_cfg.default_angles, so no-op for the leg / waist slice.
+                pass
+            else:
+                qj = d.qpos[7:][dof_idx].astype(np.float32)
+                dqj = d.qvel[6:][dof_idx].astype(np.float32)
+                quat = d.qpos[3:7].astype(np.float32)
+                omega = d.qvel[3:6].astype(np.float32)
+                g = get_gravity_orientation(quat).astype(np.float32)
+                td = target_dof_pos.astype(np.float32).copy()
+                _, _, leg_slice = squat_policy.inference(cmd_now, g, omega, qj, dqj)
+                target_dof_pos[:] = td.astype(np.float64)
+                target_dof_pos[squat_cfg.action_idx] = leg_slice.astype(np.float64)
 
             if hold_arms:
                 target_dof_pos[action_hl_idx] = d.qpos[7:][action_hl_idx].astype(np.float64)
@@ -297,6 +351,28 @@ def main() -> None:
         if remaining > 0.0:
             time.sleep(remaining)
 
+    # Warm up the squat policy's recurrent hidden state with cmd=[0,0] and the
+    # stationary initial joint state, BEFORE stepping physics. Without this the
+    # first ~10 policy outputs are garbage (all-zero hidden state) and the legs
+    # jerk violently the moment we start integrating. Skipped if we're running
+    # without the squat policy at all.
+    if not args.disable_squat_policy:
+        for _ in range(max(0, int(args.policy_warmup_iters))):
+            qj0 = d.qpos[7:][dof_idx].astype(np.float32)
+            dqj0 = d.qvel[6:][dof_idx].astype(np.float32)
+            quat0 = d.qpos[3:7].astype(np.float32)
+            omega0 = d.qvel[3:6].astype(np.float32)
+            g0 = get_gravity_orientation(quat0).astype(np.float32)
+            squat_policy.inference(np.zeros_like(cmd_target), g0, omega0, qj0, dqj0)
+
+    if args.wait_for_keypress:
+        if viewer is not None:
+            viewer.sync()
+        try:
+            input("[sim2sim] Press Enter to start the squat policy / settle ... ")
+        except EOFError:
+            pass
+
     wall_anchor = time.perf_counter()
     wall_phase = 0.0
 
@@ -312,10 +388,29 @@ def main() -> None:
         pace_realtime(wall_anchor + wall_phase)
 
     settle_control_steps = max(0, int(round(args.settle_sec / control_dt)))
+    # Linear ramp of the squat command from [0, 0] -> cmd_target over the first
+    # ``cmd_ramp_sec`` seconds of settle (bounded by settle itself). The
+    # trajectory tracking phase keeps ``cmd_now == cmd_target``. Irrelevant when
+    # the squat policy is disabled.
+    if args.disable_squat_policy:
+        cmd_ramp_steps = 0
+    else:
+        cmd_ramp_steps = min(
+            settle_control_steps,
+            max(0, int(round(max(0.0, float(args.cmd_ramp_sec)) / control_dt))),
+        )
     le_hold = np.zeros(6, dtype=np.float64)
     re_hold = np.zeros(6, dtype=np.float64)
-    for _ in range(settle_control_steps):
+    for k in range(settle_control_steps):
+        if cmd_ramp_steps <= 0:
+            cmd_now[:] = cmd_target
+        elif k < cmd_ramp_steps:
+            alpha = float(k + 1) / float(cmd_ramp_steps)
+            cmd_now[:] = alpha * cmd_target
+        else:
+            cmd_now[:] = cmd_target
         advance_one_control_step(hold_arms=True, le=le_hold, re=re_hold)
+    cmd_now[:] = cmd_target
 
     left_pose7_0, right_pose7_0 = actual_arm_pose7_for_metrics(m, d, dof_idx, args.metrics_actual_source)
     left_start_pos = left_pose7_0[:3].copy()
