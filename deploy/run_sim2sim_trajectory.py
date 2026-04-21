@@ -5,8 +5,10 @@ Sim2sim trajectory tracking benchmark for OpenWBT (MuJoCo + squat policy + Pinoc
 Reference trajectory: CSV with columns matching ``TrajectorySampler`` in
 ``rl_ik_solver/.../trajectory.py`` (torso-frame wrist targets as x,y,z,roll,pitch,yaw).
 
-Metrics: same definitions as ``TrackingErrorMonitor`` in that file; actual pose is
-MuJoCo ``left_wrist_yaw_link`` / ``right_wrist_yaw_link`` expressed in ``torso_link``.
+Metrics: same definitions as ``TrackingErrorMonitor`` in that file. Command and
+error are both **``wrist_yaw_link`` in ``torso_link``** (CSV + MuJoCo bodies).
+IK internally tracks Pinocchio ``L_ee`` / ``R_ee`` (``+0.05`` m along wrist x from
+``robot_arm_ik``); the script maps wrist targets to that frame before ``solve_ik``.
 
 Run from repository root::
 
@@ -45,11 +47,17 @@ from deploy.evaluation.tracking_metrics import (
     quat_wxyz_slerp,
     quaternion_wxyz_to_matrix,
     rpy_to_quaternion_wxyz,
+    t_trans,
     T_to_pose7_xyz_quat_wxyz,
 )
 from deploy.helpers.policy_unified import SquatLowLevelPolicy
 from deploy.helpers.rotation_helper import get_gravity_orientation
 from deploy.teleop.robot_control.robot_arm_ik import G1_29_ArmIK
+
+# Pinocchio ``L_ee`` / ``R_ee`` frames attach to ``left_wrist_yaw_joint`` with this
+# translation from the joint (same as ``G1_29_ArmIK``). CSV / metrics use
+# ``wrist_yaw_link``; multiply before IK so the solver tracks the intended wrist pose.
+_T_WRIST_YAW_TO_IK_EE = t_trans(np.array([0.05, 0.0, 0.0], dtype=np.float64))
 
 
 def mj_body_T_world(m: mujoco.MjModel, d: mujoco.MjData, body_name: str) -> np.ndarray:
@@ -185,11 +193,13 @@ def main() -> None:
             if hold_arms:
                 target_dof_pos[action_hl_idx] = d.qpos[7:][action_hl_idx].astype(np.float64)
             else:
-                T_torso_l = euler_xyz_to_T(left_euler6[:3], left_euler6[3:6])
-                T_torso_r = euler_xyz_to_T(right_euler6[:3], right_euler6[3:6])
+                T_torso_wrist_l = euler_xyz_to_T(left_euler6[:3], left_euler6[3:6])
+                T_torso_wrist_r = euler_xyz_to_T(right_euler6[:3], right_euler6[3:6])
+                T_torso_ik_l = T_torso_wrist_l @ _T_WRIST_YAW_TO_IK_EE
+                T_torso_ik_r = T_torso_wrist_r @ _T_WRIST_YAW_TO_IK_EE
                 T_w_t = mj_body_T_world(m, d, "torso_link")
-                T_tgt_l_w = T_w_t @ T_torso_l
-                T_tgt_r_w = T_w_t @ T_torso_r
+                T_tgt_l_w = T_w_t @ T_torso_ik_l
+                T_tgt_r_w = T_w_t @ T_torso_ik_r
 
                 q_arm = d.qpos[7:][action_hl_idx].astype(np.float64)
                 dq_arm = d.qvel[6:][action_hl_idx].astype(np.float64)
