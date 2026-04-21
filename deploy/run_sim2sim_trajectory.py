@@ -15,15 +15,23 @@ Metrics: same ``TrackingErrorMonitor`` math as ``trajectory.py``. By default
 CSV targets remain 6D torso-frame wrist (same as RL command). IK still maps
 wrist targets to Pinocchio ``L_ee`` / ``R_ee`` before ``solve_ik``.
 
+The summary JSON and sibling ``*.npz`` trace are written in the same schema as
+``rl_ik_solver/.../trajectory.py`` (``tracking_error`` / ``smoothness`` /
+``compute`` dicts, 14-D ``joint_cmd`` in ``LEFT_ARM_POLICY_IDX`` ||
+``RIGHT_ARM_POLICY_IDX`` order) so R2S2's ``plot_tracking_trace.py`` and any
+RL-vs-WBT side-by-side scripts can consume them unchanged. ``runtime_type`` is
+``"openwbt_sim2sim"`` and ``compute.time_ms_*`` reports per-control-step IK
+solve time (the R2S2 equivalent of policy inference time).
+
 Run from repository root::
 
     python deploy/run_sim2sim_trajectory.py \
         --trajectory_csv traj1.csv \
         --viewer --realtime --wait_for_keypress \
-        --disable_squat_policy \
-        --settle_sec 1.5 --ramp_in_sec 2.0 \
-        --error_log_csv deploy/evaluation/results/sim2sim_traj1_err.csv \
-        --output_json deploy/evaluation/results/sim2sim_traj1.json
+        --settle_sec 3.0 --settle_hold_zero_sec 1.0 --cmd_ramp_sec 1.0 \
+        --stabilize_qvel_thresh 0.3 --stabilize_max_sec 5.0 \
+        --ramp_in_sec 2.0 \
+        --output_json deploy/evaluation/results/wbt_traj1.json
 
 Requires ``ckpts/squat.onnx`` (see ``deploy/configs/g1_squat.yaml``). Do not import
 ``deploy.controllers.controller`` here (USB / DDS side effects).
@@ -50,7 +58,13 @@ if str(_REPO_ROOT) not in sys.path:
 os.chdir(_REPO_ROOT)
 
 from deploy.config import Config
-from deploy.evaluation.g1_rl_trajectory_fk import fk_actual_pose7_pair_from_mujoco_qj
+from deploy.evaluation.g1_rl_trajectory_fk import (
+    LEFT_ARM_POLICY_IDX,
+    RIGHT_ARM_POLICY_IDX,
+    fk_actual_pose7_pair_from_mujoco_qj,
+    motor_q_from_qj_order,
+    policy_joint_vector_from_motor_q,
+)
 from deploy.evaluation.tracking_metrics import (
     CommandSmoothnessMonitor,
     TrackingErrorMonitor,
@@ -150,10 +164,35 @@ def main() -> None:
     )
     parser.add_argument("--trajectory_csv", type=str, required=True, help="Trajectory CSV (torso-frame wrists).")
     parser.add_argument("--output_json", type=str, default="", help="Where to write result summary JSON.")
+    parser.add_argument(
+        "--output_npz",
+        type=str,
+        default="",
+        help=(
+            "Where to write the trace NPZ (t / left_target / right_target / left_actual / "
+            "right_actual / joint_cmd / joint_cmd_t, same schema as the R2S2 RL trajectory "
+            "runner). Defaults to --output_json with suffix replaced by .npz."
+        ),
+    )
+    parser.add_argument(
+        "--no_save_trace",
+        action="store_true",
+        help="Skip writing the trace NPZ (summary JSON is still written).",
+    )
     parser.add_argument("--error_log_csv", type=str, default="", help="Optional per-step tracking error CSV.")
     parser.add_argument("--loop_trajectory", action="store_true", help="Loop CSV in time; default plays once.")
     parser.add_argument("--max_duration_sec", type=float, default=600.0, help="Safety cap when --loop_trajectory is set.")
-    parser.add_argument("--settle_sec", type=float, default=2.0, help="Squat-only pre-roll before tracking (wall clock).")
+    parser.add_argument(
+        "--settle_sec",
+        type=float,
+        default=3.0,
+        help=(
+            "Total squat-only pre-roll (wall clock) before arm ramp-in / tracking. "
+            "Split into: --settle_hold_zero_sec at cmd=0, then --cmd_ramp_sec "
+            "ramping to --squat_cmd / cmd_debug, then the remainder holding "
+            "cmd_target. Arms are PD-held at their initial qpos throughout."
+        ),
+    )
     parser.add_argument("--ramp_in_sec", type=float, default=2.0, help="Blend measured torso wrist pose to traj[0] before metrics clock.")
     parser.add_argument("--error_warmup_sec", type=float, default=0.0, help="Skip tracking stats for this many seconds after ramp-in.")
     parser.add_argument("--error_print_hz", type=float, default=2.0, help="<=0 disables periodic tracking prints.")
@@ -216,14 +255,45 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--settle_hold_zero_sec",
+        type=float,
+        default=1.0,
+        help=(
+            "At the start of settle (right after --wait_for_keypress), step physics "
+            "with the squat policy at cmd=[0, 0] for this long BEFORE ramping to "
+            "--squat_cmd / cmd_debug. Gives the robot time to land on its feet and "
+            "have the policy regulate legs at neutral stance. Counts against "
+            "--settle_sec (i.e. settle = hold_zero + cmd_ramp + hold_target)."
+        ),
+    )
+    parser.add_argument(
         "--cmd_ramp_sec",
         type=float,
         default=1.0,
         help=(
-            "During settle, ramp the squat command from [0, 0] up to --squat_cmd / "
-            "cmd_debug over this many seconds (part of --settle_sec). Stops the "
-            "legs from being commanded to a full deep squat from t=0. Set 0 to "
-            "disable and use the target command from step 1."
+            "After --settle_hold_zero_sec, ramp the squat command from [0, 0] up to "
+            "--squat_cmd / cmd_debug over this many seconds. Also counts against "
+            "--settle_sec. Set 0 to jump straight to the target command."
+        ),
+    )
+    parser.add_argument(
+        "--stabilize_qvel_thresh",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, after settle finishes, keep stepping physics with "
+            "cmd=cmd_target and arms held until max |qvel| on --dof_idx falls below "
+            "this threshold (rad/s), or --stabilize_max_sec elapses, whichever "
+            "first. 0 disables this wait. Typical value 0.2-0.5 rad/s."
+        ),
+    )
+    parser.add_argument(
+        "--stabilize_max_sec",
+        type=float,
+        default=5.0,
+        help=(
+            "Hard cap on the --stabilize_qvel_thresh wait after settle. Ignored "
+            "when --stabilize_qvel_thresh <= 0."
         ),
     )
     parser.add_argument(
@@ -294,6 +364,12 @@ def main() -> None:
     realtime_pacing = bool(args.viewer and args.realtime)
 
     counter = 0
+    # Per-control-step IK solve time, collected only while ``record_ik_time`` is
+    # True (main trajectory tracking phase, after ramp-in and
+    # ``error_warmup_sec``). Same role as ``infer_times_ms`` in the R2S2
+    # trajectory runner, so ``compute.time_ms_*`` is apples-to-apples.
+    ik_times_ms: list[float] = []
+    record_ik_time = False
 
     def physics_substep(
         hold_arms: bool,
@@ -331,8 +407,12 @@ def main() -> None:
 
                 q_arm = d.qpos[7:][action_hl_idx].astype(np.float64)
                 dq_arm = d.qvel[6:][action_hl_idx].astype(np.float64)
+                _t_ik_start = time.perf_counter()
                 sol_q, _ = arm_ik.solve_ik(T_pelvis_ik_l, T_pelvis_ik_r, q_arm, dq_arm)
+                _ik_ms = (time.perf_counter() - _t_ik_start) * 1000.0
                 target_dof_pos[action_hl_idx] = sol_q
+                if record_ik_time:
+                    ik_times_ms.append(float(_ik_ms))
 
         tau = pd_torques(kps, kds, dof_idx, target_dof_pos, m, d)
         d.ctrl[:] = 0.0
@@ -369,7 +449,10 @@ def main() -> None:
         if viewer is not None:
             viewer.sync()
         try:
-            input("[sim2sim] Press Enter to start the squat policy / settle ... ")
+            input(
+                "[sim2sim] Press Enter to start the squat policy + settle "
+                "(tracking will NOT begin until the robot is stable) ... "
+            )
         except EOFError:
             pass
 
@@ -388,29 +471,65 @@ def main() -> None:
         pace_realtime(wall_anchor + wall_phase)
 
     settle_control_steps = max(0, int(round(args.settle_sec / control_dt)))
-    # Linear ramp of the squat command from [0, 0] -> cmd_target over the first
-    # ``cmd_ramp_sec`` seconds of settle (bounded by settle itself). The
-    # trajectory tracking phase keeps ``cmd_now == cmd_target``. Irrelevant when
-    # the squat policy is disabled.
+    # Split settle_sec into three back-to-back sub-phases, all with physics +
+    # squat policy active and arms PD-held:
+    #   [0, hold_zero_steps)        -> cmd_now = 0        (robot lands + locks
+    #                                                      legs at neutral)
+    #   [hold_zero_steps, +ramp)    -> cmd_now = a*target (smooth ramp)
+    #   [+ramp, settle_end)         -> cmd_now = target   (hold target pose)
+    # Irrelevant when the squat policy is disabled (cmd_now stays 0 throughout
+    # and legs are PD-held at default_angles).
     if args.disable_squat_policy:
+        hold_zero_steps = 0
         cmd_ramp_steps = 0
     else:
-        cmd_ramp_steps = min(
+        hold_zero_steps = min(
             settle_control_steps,
+            max(0, int(round(max(0.0, float(args.settle_hold_zero_sec)) / control_dt))),
+        )
+        cmd_ramp_steps = min(
+            settle_control_steps - hold_zero_steps,
             max(0, int(round(max(0.0, float(args.cmd_ramp_sec)) / control_dt))),
         )
     le_hold = np.zeros(6, dtype=np.float64)
     re_hold = np.zeros(6, dtype=np.float64)
     for k in range(settle_control_steps):
-        if cmd_ramp_steps <= 0:
-            cmd_now[:] = cmd_target
-        elif k < cmd_ramp_steps:
-            alpha = float(k + 1) / float(cmd_ramp_steps)
+        if args.disable_squat_policy:
+            cmd_now[:] = 0.0
+        elif k < hold_zero_steps:
+            cmd_now[:] = 0.0
+        elif cmd_ramp_steps > 0 and k < hold_zero_steps + cmd_ramp_steps:
+            alpha = float(k - hold_zero_steps + 1) / float(cmd_ramp_steps)
             cmd_now[:] = alpha * cmd_target
         else:
             cmd_now[:] = cmd_target
         advance_one_control_step(hold_arms=True, le=le_hold, re=re_hold)
-    cmd_now[:] = cmd_target
+    if not args.disable_squat_policy:
+        cmd_now[:] = cmd_target
+
+    # Wait for the robot to actually stop moving before touching arms or
+    # starting metric collection. Without this, ramp-in starts while the legs
+    # are still oscillating and the IK/tracking loop inherits that transient.
+    if float(args.stabilize_qvel_thresh) > 0.0:
+        stab_max_steps = max(0, int(round(max(0.0, float(args.stabilize_max_sec)) / control_dt)))
+        stab_v = float("inf")
+        stab_done = False
+        for stab_k in range(stab_max_steps):
+            advance_one_control_step(hold_arms=True, le=le_hold, re=re_hold)
+            stab_v = float(np.max(np.abs(d.qvel[6:][dof_idx])))
+            if stab_v < float(args.stabilize_qvel_thresh):
+                print(
+                    f"[sim2sim] stabilized after extra {(stab_k + 1) * control_dt:.2f}s "
+                    f"(max|qvel|={stab_v:.3f} < {args.stabilize_qvel_thresh:.3f})"
+                )
+                stab_done = True
+                break
+        if not stab_done:
+            print(
+                f"[sim2sim] stabilize wait hit --stabilize_max_sec={args.stabilize_max_sec:.2f}s "
+                f"(max|qvel|={stab_v:.3f} >= {args.stabilize_qvel_thresh:.3f}); "
+                "proceeding to ramp-in anyway"
+            )
 
     left_pose7_0, right_pose7_0 = actual_arm_pose7_for_metrics(m, d, dof_idx, args.metrics_actual_source)
     left_start_pos = left_pose7_0[:3].copy()
@@ -461,18 +580,31 @@ def main() -> None:
 
     t_wall0 = time.perf_counter()
     control_step_idx = 0
+    trajectory_finished = False
+    stop_reason = "running"
+    # Per-control-step joint command trace, arm-only, in the
+    # ``LEFT_ARM_POLICY_IDX || RIGHT_ARM_POLICY_IDX`` order used by R2S2 so the
+    # resulting NPZ is byte-compatible with its plotters.
+    joint_cmd_times: list[float] = []
+    joint_cmd_samples: list[np.ndarray] = []
+    warmup_sec = float(args.error_warmup_sec)
     try:
         while True:
             elapsed = control_step_idx * control_dt
             if not args.loop_trajectory and elapsed > trajectory.duration + 1e-9:
+                trajectory_finished = True
+                stop_reason = "trajectory_finished"
                 break
             if args.loop_trajectory and (time.perf_counter() - t_wall0) > args.max_duration_sec:
+                stop_reason = "max_duration_reached"
                 break
 
             left_e, right_e = trajectory.sample(elapsed, loop=args.loop_trajectory)
             le = left_e.astype(np.float64)
             re = right_e.astype(np.float64)
+            record_ik_time = elapsed >= warmup_sec
             advance_one_control_step(hold_arms=False, le=le, re=re)
+            record_ik_time = False
 
             if smooth_monitor is not None:
                 smooth_monitor.update(elapsed, target_dof_pos)
@@ -485,9 +617,23 @@ def main() -> None:
                 right_actual_pose=r_act.astype(np.float64),
             )
 
+            if elapsed >= warmup_sec:
+                motor_q_cmd = motor_q_from_qj_order(target_dof_pos, dof_idx)
+                pol_cmd = policy_joint_vector_from_motor_q(motor_q_cmd)
+                arm_cmd = np.concatenate(
+                    [
+                        pol_cmd[LEFT_ARM_POLICY_IDX].astype(np.float64),
+                        pol_cmd[RIGHT_ARM_POLICY_IDX].astype(np.float64),
+                    ],
+                    axis=0,
+                )
+                joint_cmd_times.append(float(elapsed))
+                joint_cmd_samples.append(arm_cmd.copy())
+
             control_step_idx += 1
     except KeyboardInterrupt:
         print("Interrupted; writing partial summary.")
+        stop_reason = "keyboard_interrupt"
     finally:
         error_monitor.close()
         if viewer is not None:
@@ -495,6 +641,8 @@ def main() -> None:
                 viewer.close()
             except Exception:
                 pass
+
+    elapsed_control_sec = float(control_step_idx * control_dt)
 
     error_monitor.print_summary()
     if smooth_monitor is not None:
@@ -510,25 +658,90 @@ def main() -> None:
         / f"sim2sim_{traj_path.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if ik_times_ms:
+        _ik_arr = np.asarray(ik_times_ms, dtype=np.float64)
+        compute_summary = {
+            "sample_count": int(_ik_arr.size),
+            "time_ms_mean": float(_ik_arr.mean()),
+            "time_ms_std": float(_ik_arr.std(ddof=0)),
+            "time_ms_p50": float(np.percentile(_ik_arr, 50)),
+            "time_ms_p95": float(np.percentile(_ik_arr, 95)),
+            "time_ms_max": float(_ik_arr.max()),
+        }
+    else:
+        compute_summary = {
+            "sample_count": 0,
+            "time_ms_mean": None,
+            "time_ms_std": None,
+            "time_ms_p50": None,
+            "time_ms_p95": None,
+            "time_ms_max": None,
+        }
+
     summary = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "runtime_type": "openwbt_sim2sim",
         "trajectory_csv": str(traj_path),
+        "trajectory_name": traj_path.stem,
         "runner_config": str(Path(args.runner_config).resolve()),
         "squat_config": str(squat_cfg_path.resolve()),
         "xml_path": str(xml_path),
+        "loop_trajectory": args.loop_trajectory,
+        "auto_stop_on_finish": not args.loop_trajectory,
+        "trajectory_duration_sec": float(trajectory.duration),
+        "trajectory_sample_count": int(trajectory.sample_count),
         "control_dt_sec": control_dt,
         "simulation_dt_sec": sim_dt,
         "control_decimation": decimation,
         "ramp_in_sec": ramp_sec,
         "settle_sec": args.settle_sec,
-        "loop_trajectory": args.loop_trajectory,
+        "elapsed_control_sec": elapsed_control_sec,
+        "trajectory_finished": trajectory_finished,
+        "stop_reason": stop_reason,
         "tracking_error": error_monitor.get_summary(),
         "smoothness": smooth_monitor.get_summary() if smooth_monitor is not None else None,
+        "compute": compute_summary,
     }
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     print(f"Wrote summary: {out_path}")
+
+    # R2S2-compatible NPZ trace (same keys / shapes as
+    # ``trajectory.py::save_trace``). Disabled with --no_save_trace.
+    if not args.no_save_trace and error_monitor.count > 0:
+        if args.output_npz:
+            npz_path = Path(args.output_npz).expanduser().resolve()
+        else:
+            npz_path = out_path.with_suffix(".npz")
+        npz_path.parent.mkdir(parents=True, exist_ok=True)
+        em = error_monitor
+        times_arr = np.asarray(em.sample_times, dtype=np.float64)
+        lp_arr = np.stack(em.left_target_pos_samples, axis=0).astype(np.float64)
+        rp_arr = np.stack(em.right_target_pos_samples, axis=0).astype(np.float64)
+        lq_arr = np.stack(em.left_target_quat_samples, axis=0).astype(np.float64)
+        rq_arr = np.stack(em.right_target_quat_samples, axis=0).astype(np.float64)
+        lap_arr = np.stack(em.left_actual_pose_samples, axis=0).astype(np.float64)
+        rap_arr = np.stack(em.right_actual_pose_samples, axis=0).astype(np.float64)
+        left_target_arr = np.concatenate([lp_arr, lq_arr], axis=1)
+        right_target_arr = np.concatenate([rp_arr, rq_arr], axis=1)
+        if joint_cmd_samples:
+            joint_cmd_arr = np.stack(joint_cmd_samples, axis=0).astype(np.float64)
+            joint_cmd_t_arr = np.asarray(joint_cmd_times, dtype=np.float64)
+        else:
+            joint_cmd_arr = np.zeros((0, 14), dtype=np.float64)
+            joint_cmd_t_arr = np.zeros((0,), dtype=np.float64)
+        np.savez_compressed(
+            npz_path,
+            t=times_arr,
+            left_target=left_target_arr,
+            right_target=right_target_arr,
+            left_actual=lap_arr,
+            right_actual=rap_arr,
+            joint_cmd=joint_cmd_arr,
+            joint_cmd_t=joint_cmd_t_arr,
+        )
+        print(f"Wrote trace: {npz_path}")
 
 
 if __name__ == "__main__":
