@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 
 import mujoco
+import mujoco.viewer
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +65,18 @@ from deploy.teleop.robot_control.robot_arm_ik import G1_29_ArmIK
 # translation from the joint (same as ``G1_29_ArmIK``). CSV / metrics use
 # ``wrist_yaw_link``; multiply before IK so the solver tracks the intended wrist pose.
 _T_WRIST_YAW_TO_IK_EE = t_trans(np.array([0.05, 0.0, 0.0], dtype=np.float64))
+
+# ``G1_29_ArmIK`` builds a reduced Pinocchio model rooted at ``pelvis`` with the
+# three waist joints locked at 0, so the solver lives in a **pelvis frame** with
+# pelvis at the origin (no floating base). CSV targets and ``larm_forward`` /
+# ``rarm_forward`` are defined in **torso_link frame**. With waist = 0 the two
+# frames only differ by the fixed chain pelvis -> waist_yaw -> waist_roll ->
+# torso_link translation from the URDF used by the IK (see
+# ``deploy/assets/g1/g1_body29_hand14.urdf``): waist_yaw_joint xyz=(0,0,0),
+# waist_roll_joint xyz=(-0.0039635, 0, 0.044), waist_pitch_joint xyz=(0,0,0).
+# Feed the solver ``T_pelvis_target = T_PELVIS_TORSO @ T_torso_target`` otherwise
+# the target lands outside the arm workspace and the FK metric explodes.
+_T_PELVIS_TORSO = t_trans(np.array([-0.0039635, 0.0, 0.044], dtype=np.float64))
 
 
 def mj_body_T_world(m: mujoco.MjModel, d: mujoco.MjData, body_name: str) -> np.ndarray:
@@ -161,6 +174,31 @@ def main() -> None:
             "'mujoco' uses torso_link <- wrist_yaw_link bodies."
         ),
     )
+    parser.add_argument(
+        "--viewer",
+        action="store_true",
+        help=(
+            "Open mujoco.viewer.launch_passive during the run. Requires a display "
+            "(local / X-forwarding / VNC); will fail on a pure headless server."
+        ),
+    )
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help=(
+            "When --viewer is set, pace each control step to wall clock so the "
+            "viewer shows the sim at (approximately) real time."
+        ),
+    )
+    parser.add_argument(
+        "--viewer_sync_every_n_substeps",
+        type=int,
+        default=1,
+        help=(
+            "Call viewer.sync() every N physics substeps (1 = every substep, smoothest; "
+            "larger values reduce GUI overhead)."
+        ),
+    )
     args = parser.parse_args()
 
     run_cfg = Config(str(Path(args.runner_config).resolve()))
@@ -203,6 +241,10 @@ def main() -> None:
 
     cmd_raw = squat_cfg.cmd_debug.copy() if args.squat_cmd is None else np.array(args.squat_cmd, dtype=np.float32)
 
+    viewer = mujoco.viewer.launch_passive(m, d) if args.viewer else None
+    sync_every = max(1, int(args.viewer_sync_every_n_substeps))
+    realtime_pacing = bool(args.viewer and args.realtime)
+
     counter = 0
 
     def physics_substep(
@@ -225,17 +267,17 @@ def main() -> None:
             if hold_arms:
                 target_dof_pos[action_hl_idx] = d.qpos[7:][action_hl_idx].astype(np.float64)
             else:
+                # CSV target is torso_link-frame wrist_yaw_link pose. Pinocchio IK
+                # expects pelvis-frame L_ee / R_ee targets (L_ee = wrist_yaw_joint
+                # + 0.05 m along x). Compose: pelvis <- torso <- wrist_yaw <- L_ee.
                 T_torso_wrist_l = euler_xyz_to_T(left_euler6[:3], left_euler6[3:6])
                 T_torso_wrist_r = euler_xyz_to_T(right_euler6[:3], right_euler6[3:6])
-                T_torso_ik_l = T_torso_wrist_l @ _T_WRIST_YAW_TO_IK_EE
-                T_torso_ik_r = T_torso_wrist_r @ _T_WRIST_YAW_TO_IK_EE
-                T_w_t = mj_body_T_world(m, d, "torso_link")
-                T_tgt_l_w = T_w_t @ T_torso_ik_l
-                T_tgt_r_w = T_w_t @ T_torso_ik_r
+                T_pelvis_ik_l = _T_PELVIS_TORSO @ T_torso_wrist_l @ _T_WRIST_YAW_TO_IK_EE
+                T_pelvis_ik_r = _T_PELVIS_TORSO @ T_torso_wrist_r @ _T_WRIST_YAW_TO_IK_EE
 
                 q_arm = d.qpos[7:][action_hl_idx].astype(np.float64)
                 dq_arm = d.qvel[6:][action_hl_idx].astype(np.float64)
-                sol_q, _ = arm_ik.solve_ik(T_tgt_l_w, T_tgt_r_w, q_arm, dq_arm)
+                sol_q, _ = arm_ik.solve_ik(T_pelvis_ik_l, T_pelvis_ik_r, q_arm, dq_arm)
                 target_dof_pos[action_hl_idx] = sol_q
 
         tau = pd_torques(kps, kds, dof_idx, target_dof_pos, m, d)
@@ -243,12 +285,37 @@ def main() -> None:
         d.ctrl[dof_idx] = tau
         mujoco.mj_step(m, d)
         counter += 1
+        if viewer is not None and (counter % sync_every == 0):
+            if not viewer.is_running():
+                raise KeyboardInterrupt("viewer closed by user")
+            viewer.sync()
 
-    settle_physics_steps = max(0, int(args.settle_sec / sim_dt))
+    def pace_realtime(wall_deadline: float) -> None:
+        if not realtime_pacing:
+            return
+        remaining = wall_deadline - time.perf_counter()
+        if remaining > 0.0:
+            time.sleep(remaining)
+
+    wall_anchor = time.perf_counter()
+    wall_phase = 0.0
+
+    def advance_one_control_step(
+        hold_arms: bool,
+        le: np.ndarray,
+        re: np.ndarray,
+    ) -> None:
+        nonlocal wall_phase
+        for _ in range(decimation):
+            physics_substep(hold_arms=hold_arms, left_euler6=le, right_euler6=re)
+        wall_phase += control_dt
+        pace_realtime(wall_anchor + wall_phase)
+
+    settle_control_steps = max(0, int(round(args.settle_sec / control_dt)))
     le_hold = np.zeros(6, dtype=np.float64)
     re_hold = np.zeros(6, dtype=np.float64)
-    for _ in range(settle_physics_steps):
-        physics_substep(hold_arms=True, left_euler6=le_hold, right_euler6=re_hold)
+    for _ in range(settle_control_steps):
+        advance_one_control_step(hold_arms=True, le=le_hold, re=re_hold)
 
     left_pose7_0, right_pose7_0 = actual_arm_pose7_for_metrics(m, d, dof_idx, args.metrics_actual_source)
     left_start_pos = left_pose7_0[:3].copy()
@@ -278,8 +345,7 @@ def main() -> None:
         rpy_r = matrix_to_rpy(quaternion_wxyz_to_matrix(rq))
         le = np.concatenate([lp, rpy_l]).astype(np.float64)
         re = np.concatenate([rp, rpy_r]).astype(np.float64)
-        for _ in range(decimation):
-            physics_substep(hold_arms=False, left_euler6=le, right_euler6=re)
+        advance_one_control_step(hold_arms=False, le=le, re=re)
 
     error_monitor = TrackingErrorMonitor(
         print_hz=args.error_print_hz,
@@ -311,8 +377,7 @@ def main() -> None:
             left_e, right_e = trajectory.sample(elapsed, loop=args.loop_trajectory)
             le = left_e.astype(np.float64)
             re = right_e.astype(np.float64)
-            for _ in range(decimation):
-                physics_substep(hold_arms=False, left_euler6=le, right_euler6=re)
+            advance_one_control_step(hold_arms=False, le=le, re=re)
 
             if smooth_monitor is not None:
                 smooth_monitor.update(elapsed, target_dof_pos)
@@ -326,8 +391,15 @@ def main() -> None:
             )
 
             control_step_idx += 1
+    except KeyboardInterrupt:
+        print("Interrupted; writing partial summary.")
     finally:
         error_monitor.close()
+        if viewer is not None:
+            try:
+                viewer.close()
+            except Exception:
+                pass
 
     error_monitor.print_summary()
     if smooth_monitor is not None:
