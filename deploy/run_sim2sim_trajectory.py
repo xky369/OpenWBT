@@ -206,7 +206,22 @@ def main() -> None:
         nargs=2,
         default=None,
         metavar=("H", "P"),
-        help="Override squat policy command [height, pitch]; default uses squat config cmd_debug.",
+        help=(
+            "Squat policy command [height_delta, pitch_delta]. Defaults to [0, 0] "
+            "(nominal standing pose controlled by the squat policy). For a shallow "
+            "squat try e.g. '-0.2 0.0'. Values must stay within the policy's "
+            "training range (see max_cmd in the squat YAML); the default cmd_debug "
+            "is usually a deep debug pose outside that range and breaks tracking."
+        ),
+    )
+    parser.add_argument(
+        "--use_cmd_debug",
+        action="store_true",
+        help=(
+            "Force --squat_cmd = squat YAML cmd_debug (legacy deep-squat default). "
+            "Off by default because cmd_debug is often outside max_cmd training "
+            "range and causes base instability + tracking failure."
+        ),
     )
     parser.add_argument(
         "--metrics_actual_source",
@@ -356,8 +371,33 @@ def main() -> None:
     sim_dt = float(run_cfg.simulation_dt)
     control_dt = float(run_cfg.control_dt)
 
-    cmd_target = squat_cfg.cmd_debug.copy() if args.squat_cmd is None else np.array(args.squat_cmd, dtype=np.float32)
+    # Resolve the squat policy command. Default (no args) is [0, 0] = nominal
+    # standing, which keeps the base stable and leaves the arm full workspace
+    # for tracking. cmd_debug from the YAML is often a debug deep-squat value
+    # outside the policy's max_cmd training range and destabilises tracking, so
+    # it's opt-in via --use_cmd_debug.
+    if args.squat_cmd is not None:
+        cmd_target = np.array(args.squat_cmd, dtype=np.float32)
+        cmd_source = "--squat_cmd"
+    elif args.use_cmd_debug:
+        cmd_target = np.array(squat_cfg.cmd_debug, dtype=np.float32).copy()
+        cmd_source = "squat_cfg.cmd_debug (--use_cmd_debug)"
+    else:
+        cmd_target = np.zeros(2, dtype=np.float32)
+        cmd_source = "default [0, 0] (nominal standing)"
     cmd_now = np.zeros_like(cmd_target)
+
+    max_cmd = np.asarray(getattr(squat_cfg, "max_cmd", [np.inf, np.inf]), dtype=np.float32)
+    if not args.disable_squat_policy:
+        print(f"[sim2sim] squat cmd = {cmd_target.tolist()} (from {cmd_source})")
+        if np.any(np.abs(cmd_target) > max_cmd + 1e-6):
+            print(
+                f"[sim2sim] WARNING: |cmd_target|={np.abs(cmd_target).tolist()} exceeds "
+                f"max_cmd={max_cmd.tolist()} from squat YAML; policy is being driven "
+                "out of its training distribution and may destabilise the base + break tracking."
+            )
+    else:
+        print("[sim2sim] squat policy disabled; legs + waist PD-held at run_cfg.default_angles")
 
     viewer = mujoco.viewer.launch_passive(m, d) if args.viewer else None
     sync_every = max(1, int(args.viewer_sync_every_n_substeps))
