@@ -1,0 +1,16 @@
+# Extra dependencies for deploy/run_sim2sim_trajectory.py (server / headless).
+# Install on top of the project requirements.txt where applicable.
+#
+# Pinocchio: either
+#   conda install pinocchio -c conda-forge
+# or (Linux wheels may vary):
+#   pip install pin
+#
+numpy>=1.23
+PyYAML>=6.0
+scipy>=1.10
+mujoco>=3.1.0
+casadi>=3.6.0
+onnxruntime>=1.14.0
+meshcat>=0.3.2
+torch>=2.0.0
